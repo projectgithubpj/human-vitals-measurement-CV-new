@@ -68,4 +68,4 @@ function StatsPanel({ vitals }) {
   );
 }
 
-export default StatsPanel;
+export default StatsPanel
