@@ -3,11 +3,12 @@ rPPG (Remote Photoplethysmography) Signal Processor
 Uses the CHROM (Chrominance-based) method for heart rate estimation.
 Reference: De Haan & Jeanne (2013) - Robust Pulse Rate From Chrominance-Based rPPG
 
-v2 changes
+v3 changes
 ----------
-- Exposes `latest_pulse_sample` (float) so VideoProcessor can feed
-  each frame's pulse value into RespiratoryProcessor without re-processing.
-- Everything else is unchanged.
+- Exposes `latest_pulse_sample` (float) so VideoProcessor can feed each
+  frame's pulse value into RespiratoryProcessor and BVPProcessor without
+  re-processing.
+- Everything else is unchanged from v2.
 """
 
 import numpy as np
@@ -64,7 +65,7 @@ class RPPGProcessor:
         self.pulse_signal = np.array([])
         self.bpm_history: deque = deque(maxlen=10)
 
-        # NEW: latest single pulse sample for respiratory processor
+        # Latest single pulse sample for respiratory + BVP processors
         self.latest_pulse_sample: float = 0.0
 
         # Minimum frames before we attempt estimation
@@ -170,7 +171,7 @@ class RPPGProcessor:
         pulse_filt = Xf - alpha * Yf
         self.pulse_signal = pulse_filt
 
-        # Store latest sample for RespiratoryProcessor
+        # Store latest sample for RespiratoryProcessor and BVPProcessor
         self.latest_pulse_sample = float(pulse_filt[-1])
 
         # 6. Frequency analysis (Welch PSD)

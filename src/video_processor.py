@@ -1,15 +1,14 @@
 """
-Video Stream Processor  (v4 – Performance Optimized)
-=====================================================
-Key optimizations over v3:
-- HRV computed every HRV_INTERVAL_FRAMES (60 frames = ~2 s) instead of every frame.
-  The wavelet CWT in hrv_processor is expensive (~50-100 ms); running it at 30 fps
-  was the primary cause of lag.
-- Heavy HRV payload fields (psd_freqs, psd_values, wt_lf_hf_trend, rr_intervals)
-  are sent only every HRV_PAYLOAD_INTERVAL_FRAMES to further cut WebSocket traffic.
-- Frame encoding drops to ENCODE_FPS (15 fps) — the human eye cannot perceive the
-  difference at this latency but it halves the WebSocket bandwidth.
-- FPS sync to sub-processors happens every SYNC_INTERVAL_FRAMES, not every frame.
+Video Stream Processor  (v5 – BVP Integration)
+===============================================
+Changes over v4:
+- Adds BVPProcessor to the pipeline.  BVP analysis runs every
+  BVP_INTERVAL_FRAMES (same cadence as HRV, ~2 s) since per-beat morphology
+  is stable on that timescale.
+- The lightweight BVP scalar fields (ibi_ms, perfusion_index, bvp_sqi, etc.)
+  are sent every frame from the cache; the bvp_signal waveform array is
+  bundled with the HRV heavy-payload refresh to avoid excess bandwidth.
+- Everything else is unchanged from v4.
 """
 
 import cv2
@@ -23,27 +22,23 @@ from .face_roi import FaceROIExtractor
 from .rppg_processor import RPPGProcessor
 from .respiratory_processor import RespiratoryProcessor
 from .hrv_processor import HRVProcessor
+from .bvp_processor import BVPProcessor
 
 # ── Tunable constants ────────────────────────────────────────────────────────
-# How often (in frames) to run the full HRV pipeline (bandpass + peaks + Welch + CWT).
-# At 30 fps: 60 frames = every ~2 seconds. HRV metrics change slowly so this is fine.
-HRV_INTERVAL_FRAMES = 60
+HRV_INTERVAL_FRAMES     = 60    # run full HRV pipeline every ~2 s
+HRV_PAYLOAD_INTERVAL_FRAMES = 90  # send large spectral arrays every ~3 s
 
-# How often to send the large HRV spectral arrays (PSD, wavelet trend, RR intervals).
-# These are large lists — sending every frame wastes bandwidth.
-HRV_PAYLOAD_INTERVAL_FRAMES = 90   # every ~3 s
+# BVP morphology analysis cadence — same as HRV (beat morphology changes slowly)
+BVP_INTERVAL_FRAMES     = 60
 
-# Encode and send frames at this rate (fps). Halving from 30→15 cuts frame bandwidth 50%.
-ENCODE_FPS = 15
-
-# Sync sub-processor FPS every N frames (cheap but no need to do it every frame).
-SYNC_INTERVAL_FRAMES = 30
+ENCODE_FPS              = 15   # frame encoding rate
+SYNC_INTERVAL_FRAMES    = 30   # sub-processor FPS sync
 # ────────────────────────────────────────────────────────────────────────────
 
 
 class VideoProcessor:
     """
-    Manages webcam capture and coordinates rPPG + respiratory + HRV pipeline.
+    Manages webcam capture and coordinates rPPG + respiratory + HRV + BVP pipeline.
 
     Usage:
         vp = VideoProcessor(on_result=my_callback)
@@ -75,6 +70,7 @@ class VideoProcessor:
         self.rppg          = RPPGProcessor(fps=target_fps, window_sec=15.0)
         self.respiratory   = RespiratoryProcessor(fps=target_fps, window_sec=30.0)
         self.hrv           = HRVProcessor(fps=target_fps, window_sec=60.0)
+        self.bvp           = BVPProcessor(fps=target_fps, window_sec=10.0)
 
         # Diagnostics
         self.frame_count  = 0
@@ -82,10 +78,12 @@ class VideoProcessor:
         self._fps_times: list = []
         self.is_running   = False
 
-        # ── Performance: cached HRV state ────────────────────────────────
-        self._hrv_result_cache: dict = {}          # last computed HRV result
-        self._hrv_heavy_cache:  dict = {}          # last large-payload HRV fields
-        self._last_encode_time: float = 0.0        # for ENCODE_FPS throttle
+        # ── Performance: cached state ─────────────────────────────────
+        self._hrv_result_cache: dict = {}
+        self._hrv_heavy_cache:  dict = {}
+        self._bvp_result_cache: dict = {}   # BVP light fields
+        self._bvp_heavy_cache:  dict = {}   # BVP waveform (sent periodically)
+        self._last_encode_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -151,7 +149,7 @@ class VideoProcessor:
 
             last_frame_time = now
             self.frame_count += 1
-            fc = self.frame_count   # local alias
+            fc = self.frame_count
 
             # FPS measurement
             self._fps_times.append(now)
@@ -167,29 +165,36 @@ class VideoProcessor:
             if fc % SYNC_INTERVAL_FRAMES == 0:
                 self.respiratory.update_fps(self.detected_fps)
                 self.hrv.update_fps(self.detected_fps)
+                self.bvp.update_fps(self.detected_fps)
 
             if face_roi is None:
                 # Feed zeros to keep buffers in sync
                 rr_result = self.respiratory.add_frame(rppg_pulse_value=0.0, nose_y=None)
 
-                # Only run HRV on schedule
                 if fc % HRV_INTERVAL_FRAMES == 0:
                     hrv_raw = self.hrv.add_pulse_sample(0.0)
                     self._update_hrv_cache(hrv_raw, fc)
 
+                if fc % BVP_INTERVAL_FRAMES == 0:
+                    bvp_raw = self.bvp.add_pulse_sample(0.0)
+                    self._update_bvp_cache(bvp_raw, fc)
+                else:
+                    self.bvp.pulse_buf.append(0.0)
+
                 result = {
-                    "heart_rate":    0,
-                    "confidence":    0.0,
-                    "bpm_min":       0,
-                    "bpm_max":       0,
-                    "pulse_signal":  [],
+                    "heart_rate":     0,
+                    "confidence":     0.0,
+                    "bpm_min":        0,
+                    "bpm_max":        0,
+                    "pulse_signal":   [],
                     "signal_quality": 0.0,
-                    "status":        "No face detected – position yourself in frame",
-                    "face_detected": False,
+                    "status":         "No face detected – position yourself in frame",
+                    "face_detected":  False,
                     **rr_result,
                     **self._build_hrv_payload(fc),
-                    "fps":           round(self.detected_fps, 1),
-                    "frame_b64":     self._maybe_encode(frame, now, encode_interval),
+                    **self._build_bvp_payload(fc),
+                    "fps":            round(self.detected_fps, 1),
+                    "frame_b64":      self._maybe_encode(frame, now, encode_interval),
                 }
             else:
                 # ---- Heart rate (rPPG) — every frame ----
@@ -204,18 +209,25 @@ class VideoProcessor:
                     nose_y=nose_y,
                 )
 
-                # ---- HRV — throttled to HRV_INTERVAL_FRAMES ----
+                # ---- HRV — throttled ----
                 if fc % HRV_INTERVAL_FRAMES == 0:
                     hrv_raw = self.hrv.add_pulse_sample(self.rppg.latest_pulse_sample)
                     self._update_hrv_cache(hrv_raw, fc)
                 else:
-                    # Still feed the sample so the buffer stays current, but skip compute
                     self.hrv.pulse_buf.append(float(self.rppg.latest_pulse_sample))
+
+                # ---- BVP — throttled ----
+                if fc % BVP_INTERVAL_FRAMES == 0:
+                    bvp_raw = self.bvp.add_pulse_sample(self.rppg.latest_pulse_sample)
+                    self._update_bvp_cache(bvp_raw, fc)
+                else:
+                    self.bvp.pulse_buf.append(float(self.rppg.latest_pulse_sample))
 
                 result = {
                     **hr_result,
                     **rr_result,
                     **self._build_hrv_payload(fc),
+                    **self._build_bvp_payload(fc),
                     "face_detected": True,
                     "face_bbox":     face_roi.face_bbox,
                     "face_quality":  round(face_roi.quality_score, 2),
@@ -227,32 +239,40 @@ class VideoProcessor:
                 self.on_result(result)
 
     # ------------------------------------------------------------------
-    # HRV cache helpers
+    # HRV cache helpers  (unchanged from v4)
     # ------------------------------------------------------------------
 
     def _update_hrv_cache(self, hrv_raw: dict, fc: int):
-        """Split HRV result into lightweight (sent every cycle) and heavy (sent periodically)."""
         HEAVY_KEYS = {'psd_freqs', 'psd_values', 'wt_lf_hf_trend', 'rr_intervals'}
-
-        light = {}
-        heavy = {}
+        light, heavy = {}, {}
         for k, v in hrv_raw.items():
-            if k in HEAVY_KEYS:
-                heavy[k] = v
-            else:
-                light[k] = v
-
+            (heavy if k in HEAVY_KEYS else light)[k] = v
         self._hrv_result_cache = light
-        # Only refresh heavy payload on schedule
         if fc % HRV_PAYLOAD_INTERVAL_FRAMES == 0:
             self._hrv_heavy_cache = heavy
 
     def _build_hrv_payload(self, fc: int) -> dict:
-        """Return the prefixed HRV dict to merge into the result."""
-        payload = {**self._hrv_result_cache}
-        # Always include heavy keys (may be empty dict until first compute)
-        payload.update(self._hrv_heavy_cache)
+        payload = {**self._hrv_result_cache, **self._hrv_heavy_cache}
         return self._prefix_hrv(payload)
+
+    # ------------------------------------------------------------------
+    # BVP cache helpers
+    # ------------------------------------------------------------------
+
+    def _update_bvp_cache(self, bvp_raw: dict, fc: int):
+        """Split BVP result into light (sent every cycle) and heavy (waveform)."""
+        HEAVY_KEYS = {'bvp_signal', 'ibi_arr'}
+        light, heavy = {}, {}
+        for k, v in bvp_raw.items():
+            (heavy if k in HEAVY_KEYS else light)[k] = v
+        self._bvp_result_cache = light
+        # Refresh waveform on same schedule as HRV heavy payload
+        if fc % HRV_PAYLOAD_INTERVAL_FRAMES == 0:
+            self._bvp_heavy_cache = heavy
+
+    def _build_bvp_payload(self, fc: int) -> dict:
+        """Return the BVP dict to merge into the result."""
+        return {**self._bvp_result_cache, **self._bvp_heavy_cache}
 
     # ------------------------------------------------------------------
     # Frame encoding — throttled to ENCODE_FPS
@@ -260,7 +280,6 @@ class VideoProcessor:
 
     def _maybe_encode(self, frame_bgr: np.ndarray, now: float,
                       encode_interval: float) -> str:
-        """Only re-encode if enough time has passed since last encode."""
         if now - self._last_encode_time >= encode_interval:
             self._last_encode_time = now
             self._last_frame_b64 = self._encode_frame(frame_bgr)
@@ -288,8 +307,6 @@ class VideoProcessor:
         for k, v in hrv_result.items():
             if k == "status":
                 out["hrv_status_msg"] = v
-            elif k in PASSTHROUGH:
-                out[k] = v
             else:
                 out[k] = v
         return out
